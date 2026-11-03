@@ -2,6 +2,7 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 identifier: hello_books_api
 type: service
+owner: group:account/Platform_Learning_Team
 metadata:
   name: hello-books-api
   description: HelloBooks learning API
