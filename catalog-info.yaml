@@ -1,5 +1,6 @@
 apiVersion: backstage.io/v1alpha1
 kind: Component
+identifier: hello-books-api
 metadata:
   name: hello-books-api
   description: HelloBooks learning API
