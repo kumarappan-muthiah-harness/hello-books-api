@@ -1,8 +1,11 @@
 apiVersion: harness.io/v1
 kind: Component
+name: Hello Books Api
 identifier: hello_books_api
 type: service
 owner: group:account/Platform_Learning_Team
+spec:
+  lifecycle: experimental
 metadata:
   name: hello-books-api
   description: HelloBooks learning API
@@ -10,8 +13,6 @@ metadata:
     - learning
   annotations:
     backstage.io/techdocs-ref: dir:.
-spec:
-  type: service
-  lifecycle: experimental
-  owner: Platform_Learning_Team
-  system: HelloBooks_Platform
+
+
+
