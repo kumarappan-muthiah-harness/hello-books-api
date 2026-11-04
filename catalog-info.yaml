@@ -1,18 +1,24 @@
 apiVersion: harness.io/v1
 kind: Component
-name: Hello Books Api
-identifier: hello_books_api
 type: service
+identifier: hello_books_api
+name: Hello Books Api
 owner: group:account/Platform_Learning_Team
 spec:
   lifecycle: experimental
+  sourceCode:
+    provider: Github
+    repoName: hello-books-api
+    connectorRef: account.Github_connector
+    branch: main
+    monoRepo: false
+    url: https://github.com/kumarappan-muthiah-harness/hello-books-api/tree/main
+  system:
+  - system:account/HelloBooks_Platform
 metadata:
   name: hello-books-api
   description: HelloBooks learning API
-  tags:
-    - learning
   annotations:
     backstage.io/techdocs-ref: dir:.
-
-
-
+  tags:
+  - learning
