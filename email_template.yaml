@@ -1,0 +1,216 @@
+template:
+  name: Email Template
+  type: Stage
+  projectIdentifier: default_project
+  orgIdentifier: default
+  spec:
+    type: Custom
+    spec:
+      execution:
+        steps:
+          - stepGroup:
+              identifier: download_email
+              name: download email
+              steps:
+                - step:
+                    identifier: Container_1
+                    type: Container
+                    name: Container_1
+                    spec:
+                      connectorRef: Public_Docker
+                      image: google/cloud-sdk:slim
+                      command: |-
+                        #!/bin/bash
+                        set -e
+
+                        echo "===== Settings ====="
+                        # Public GitHub template used as the email body source
+                        TEMPLATE_URL="https://raw.githubusercontent.com/leemunroe/responsive-html-email-template/master/email.html"
+                        # Size the final report file is padded to (bytes)
+                        TARGET_SIZE=13000
+                        WORK=/tmp/repro
+                        DOWNLOADED=/tmp/emailbody_downloaded.html
+                        mkdir -p "$WORK"
+                        echo "Template URL: $TEMPLATE_URL"
+                        echo "Target size : $TARGET_SIZE bytes"
+
+                        echo "===== Downloading Email HTML Template from GitHub ====="
+                        set +e
+                        curl -sfL --retry 3 --max-time 60 "$TEMPLATE_URL" -o "$WORK/template.html"
+                        CURL_EXIT_CODE=$?
+                        set -e
+                        echo "curl exit code: $CURL_EXIT_CODE"
+
+                        if [ $CURL_EXIT_CODE -ne 0 ] || [ ! -s "$WORK/template.html" ]; then
+                          echo "WARNING: Failed to download email template from GitHub"
+                          FALLBACK_HTML="<p>Report download failed</p>"
+                          echo "EMAIL_SUBJECT=RTR Engine Test Report - Build <+pipeline.sequenceId> - <+pipeline.variables.TestCategory> - Download Failed" >> $DRONE_OUTPUT
+                          echo "FAILED_COUNT=0" >> $DRONE_OUTPUT
+                          echo "EMAIL_HTML=${FALLBACK_HTML}" >> $DRONE_OUTPUT
+                          exit 0
+                        fi
+                        echo "Template size: $(wc -c < "$WORK/template.html") bytes"
+
+                        echo "===== Building test report from template ====="
+                        # 1. Add a Total row (same markers the real report has: <b>Total</b> and badge-fail)
+                        cat > "$WORK/snippet.html" << 'EOF'
+                        <table>
+                        <tr><th>Suite</th><th>Total</th><th>Passed</th><th>Failed</th></tr>
+                        <tr>
+                        <td><b>Total</b></td>
+                        <td>400</td>
+                        <td class="badge-pass">380</td>
+                        <td class="badge-fail">18</td>
+                        </tr>
+                        </table>
+                        EOF
+
+                        LINE=$(grep -n '</body>' "$WORK/template.html" | tail -1 | cut -d: -f1)
+                        if [ -n "$LINE" ]; then
+                          head -n $((LINE-1)) "$WORK/template.html" > "$WORK/report.html"
+                          cat "$WORK/snippet.html" >> "$WORK/report.html"
+                          tail -n +"$LINE" "$WORK/template.html" >> "$WORK/report.html"
+                        else
+                          echo "No </body> found in template, appending Total row at the end"
+                          cat "$WORK/template.html" "$WORK/snippet.html" > "$WORK/report.html"
+                        fi
+
+                        # 2. CRLF line endings (exercises the \r stripping)
+                        sed -i 's/$/\r/' "$WORK/report.html"
+
+                        # 3. UTF-8 BOM at the start (exercises the BOM stripping)
+                        printf '\xEF\xBB\xBF' | cat - "$WORK/report.html" > "$WORK/report_bom.html"
+                        mv "$WORK/report_bom.html" "$WORK/report.html"
+
+                        # 4. Pad with an HTML comment so the file is exactly TARGET_SIZE bytes
+                        #    (comment adds 11 bytes of overhead: '<!-- ' + ' -->' + CRLF)
+                        CUR_SIZE=$(wc -c < "$WORK/report.html")
+                        PAD=$((TARGET_SIZE - CUR_SIZE - 11))
+                        if [ "$PAD" -gt 0 ]; then
+                          printf '<!-- ' >> "$WORK/report.html"
+                          head -c "$PAD" /dev/zero | tr '\0' 'x' >> "$WORK/report.html"
+                          printf ' -->\r\n' >> "$WORK/report.html"
+                        else
+                          echo "Template is already larger than $TARGET_SIZE bytes, no padding added"
+                        fi
+
+                        cp "$WORK/report.html" "$DOWNLOADED"
+
+                        echo "✓ Email HTML downloaded successfully"
+                        echo "  Content length: $(wc -c < "$DOWNLOADED") bytes"
+
+                        # ===== Extract Failed Test Count from HTML =====
+                        echo "===== Extracting Failed Test Count from Total Row ====="
+                        # Guard grep/sed with '|| true' so a no-match doesn't trigger 'set -e' and
+                        # prematurely exit the script before the output variables are written.
+                        FAILED_COUNT=$(grep -A 5 '<b>Total</b>' /tmp/emailbody_downloaded.html | grep 'badge-fail' | sed -n 's/.*badge-fail">\([0-9]*\).*/\1/p' | head -1 || true)
+
+                        if [ -z "$FAILED_COUNT" ]; then
+                          echo "⚠️  Failed count not found in Total row, defaulting to 0"
+                          FAILED_COUNT=0
+                        else
+                          echo "✓ Failed count extracted from Total row: $FAILED_COUNT"
+                        fi
+
+                        # ===== Generate Dynamic Email Subject =====
+                        echo "===== Generating Dynamic Email Subject ====="
+                        echo "########################################"
+                        echo "    Total Failed Tests: $FAILED_COUNT"
+                        echo "########################################"
+
+                        if [ "$FAILED_COUNT" -ne 0 ]; then
+                          EMAIL_SUBJECT="!! RTR Engine Test Report - Build <+pipeline.sequenceId> - <+pipeline.variables.TestCategory> - Failed: ${FAILED_COUNT}"
+                          echo "✓ Subject set for failed tests: $EMAIL_SUBJECT"
+                        else
+                          EMAIL_SUBJECT="RTR Engine Test Report - Build <+pipeline.sequenceId> - <+pipeline.variables.TestCategory> - All Passed"
+                          echo "✓ Subject set for all passed: $EMAIL_SUBJECT"
+                        fi
+
+                        # Sanitize downloaded HTML before embedding it in the Harness output
+                        # variable:
+                        #  1. Strip UTF-8 BOM (leading EF BB BF bytes), if present
+                        #  2. Strip CR characters (\r)
+                        #  3. Convert double quotes to single quotes - HTML attributes render
+                        #     identically with either quote style, but unescaped " characters
+                        #     corrupt the internal JSON payload Harness builds when substituting
+                        #     this value into the downstream Email step's body field, resulting
+                        #     in a silently blank body even though this variable's length is
+                        #     correct here in the logs.
+                        #  4. Collapse to a single line (required for $DRONE_OUTPUT KEY=VALUE format)
+                        EMAIL_HTML_FLAT=$(sed '1s/^\xEF\xBB\xBF//' /tmp/emailbody_downloaded.html \
+                          | tr -d '\r' \
+                          | sed "s/\"/'/g" \
+                          | tr '\n' ' ')
+
+                        # Safety net: never allow an empty body to reach the Email step, since
+                        # Harness's Email step rejects blank bodies with "Email body cannot be blank".
+                        if [ -z "$EMAIL_HTML_FLAT" ]; then
+                          echo "⚠️ EMAIL_HTML_FLAT is empty after flattening, using fallback content"
+                          EMAIL_HTML_FLAT="<p>Test report content unavailable.</p>"
+                        fi
+
+                        echo "DEBUG: EMAIL_HTML_FLAT length = ${#EMAIL_HTML_FLAT}"
+                        echo "----- EMAIL_HTML_FLAT PREVIEW -----"
+                        echo "${EMAIL_HTML_FLAT:0:200}"
+                        echo "------------------------------------"
+
+                        echo "Star of Assignment"
+                        EMAIL_HTML=$EMAIL_HTML_FLAT
+                        echo "$EMAIL_HTML"
+                        echo "EMAIL_SUBJECT=${EMAIL_SUBJECT}" >> $DRONE_OUTPUT
+                        echo "FAILED_COUNT=${FAILED_COUNT}" >> $DRONE_OUTPUT
+                        echo "EMAIL_HTML=${EMAIL_HTML_FLAT}" >> $DRONE_OUTPUT
+
+                        echo "===== Email Body and Subject Ready for Sending ====="
+                        echo "  Email Subject: $EMAIL_SUBJECT"
+                        echo "  Failed Count: $FAILED_COUNT"
+
+                        # Cleanup
+                        rm -rf /tmp/emailbody_downloaded.html "$WORK"
+                        echo "✓ Cleanup completed"
+                      shell: Bash
+                      infrastructure:
+                        type: KubernetesDirect
+                        spec:
+                          connectorRef: k8sconnector
+                          namespace: harness-delegate-ng
+                          resources:
+                            limits:
+                              cpu: "0.5"
+                              memory: 500Mi
+                          annotations: {}
+                          labels: {}
+                          containerSecurityContext:
+                            capabilities:
+                              drop: []
+                              add: []
+                          nodeSelector: {}
+                      reports:
+                        type: JUnit
+                        spec:
+                          paths: []
+                      outputVariables:
+                        - name: EMAIL_SUBJECT
+                        - name: EMAIL_HTML
+                        - name: DRONE_OUTPUT
+                      envVariables: {}
+                    timeout: 2m
+          - step:
+              identifier: Email_1
+              type: Email
+              name: Email_1
+              spec:
+                cc: ""
+                subject: <+pipeline.stages.tet_email.spec.execution.steps.download_email.steps.Container_1.ContainerStep.output.outputVariables.EMAIL_SUBJECT>
+                body: <+pipeline.stages.tet_email.spec.execution.steps.download_email.steps.Container_1.ContainerStep.output.outputVariables.EMAIL_HTML>
+                toUserGroups: []
+                to: <+input>
+                fireAndForget: false
+              timeout: 10m
+      environment:
+        environmentRef: Test_Env
+        deployToAll: false
+        infrastructureDefinitions:
+          - identifier: test_infra
+  identifier: Download_HTML_and_sen_it_as_a_email
+  versionLabel: 1.0.0
